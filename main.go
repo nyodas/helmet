@@ -12,7 +12,12 @@ import (
 	"os"
 	"os/exec"
 
+	"bytes"
+	"crypto/md5"
+
+	"github.com/daemonza/helmet/s3connector"
 	"github.com/golang/glog"
+	"io/ioutil"
 )
 
 var (
@@ -20,6 +25,9 @@ var (
 	host   *string
 	port   *string
 	charts *string
+	bucket *string
+	aws    *bool
+	s3Conn s3connector.Connector
 )
 
 // helm is a wrapper function to execute the helm command on the
@@ -44,13 +52,13 @@ func helm(arguments []string) (output []byte, err error) {
 func initRepo() error {
 	// TODO check if directory is there and create
 	// if needed
-	err := os.MkdirAll("./charts", 0777)
+	err := os.MkdirAll(*charts, 0777)
 	if err != nil {
 		glog.Error(err.Error())
 		return err
 	}
 	// generate helm index
-	_, err = helm([]string{"repo", "index", "./charts/", "--url", *url})
+	_, err = helm([]string{"repo", "index", *charts, "--url", *url})
 	if err != nil {
 		glog.Error(err.Error())
 		return err
@@ -64,23 +72,31 @@ func upload(c echo.Context) error {
 	// TODO - do some sanitising on chartName
 
 	glog.Info("uploading " + chartName)
+	pathCharts := path.Join(*charts, chartName)
 	os.Stat(*charts)
-	f, err := os.Create("charts/" + chartName)
+	f, err := os.Create(pathCharts)
 	defer f.Close()
 	if err != nil {
 		glog.Error(err.Error())
 		return err
 	}
-
-	_, err = io.Copy(f, c.Request().Body)
+	fileContent, err := ioutil.ReadAll(c.Request().Body)
+	fileReader := bytes.NewReader(fileContent)
+	_, err = io.Copy(f, fileReader)
 	defer c.Request().Body.Close()
 	if err != nil {
 		glog.Error(err.Error())
 		return err
 	}
-
 	glog.Info("done uploading " + chartName)
 
+	if *aws {
+		// Double Upload to S3
+		err = s3Conn.UploadS3(chartName, fileReader, *bucket)
+		if err != nil {
+			glog.Errorf("Failed to upload to S3 %s", err)
+		}
+	}
 	// generate helm index
 	initRepo()
 
@@ -89,10 +105,48 @@ func upload(c echo.Context) error {
 
 // repo  serves back any files in the charts directory
 // with content-type header set to text/yaml
-func repo(c echo.Context) error {
+func repo(c echo.Context) (err error) {
 	//c.Response().Header().Set("content-type", "text/yaml")
 	c.Response().Header().Set("content-type", "text/plain; charset=utf-8")
-	return c.File(path.Join("charts", c.Param("*")))
+	chartName := c.Param("*")
+	filePath := path.Join(*charts, chartName)
+
+	if *aws {
+		localFileSum, err := md5file(filePath)
+		if err != nil {
+			glog.V(4).Infof("Failed to checksum %s", err)
+		}
+
+		s3FileSum, err := s3Conn.ChecksumS3(chartName, *bucket)
+		if err != nil {
+			glog.V(4).Infof("Failed to check remote checksum %s", err)
+		}
+
+		if localFileSum == s3FileSum && localFileSum != "" {
+			// local file when checksum match
+			return c.File(filePath)
+		}
+		err = s3Conn.DownloadS3(filePath, chartName, *bucket)
+		if err != nil {
+			glog.Errorf("Failed to download in S3 %s", err)
+		}
+	}
+	return c.File(filePath)
+}
+
+func md5file(filePath string) (md5checksum string, err error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return md5checksum, err
+	}
+	md5checksum = fmt.Sprintf("%x", h.Sum(nil))
+	return
 }
 
 func init() {
@@ -103,8 +157,9 @@ func init() {
 	host = flag.String("host", "0.0.0.0", "The address that Helmet listens on")
 	port = flag.String("port", "1323", "The port that Helmet listens on")
 	charts = flag.String("charts", "./charts", "Directory where charts get's stored")
+	bucket = flag.String("bucket", "charts", "The Bucket where Helmet upload")
+	aws = flag.Bool("aws", false, "Use aws s3 as a backend")
 	flag.Parse()
-
 	// initialize the helm repository on startup.
 	err := initRepo()
 	if err != nil {
@@ -113,6 +168,9 @@ func init() {
 }
 
 func main() {
+	if *aws {
+		s3Conn = s3connector.New()
+	}
 
 	e := echo.New()
 
